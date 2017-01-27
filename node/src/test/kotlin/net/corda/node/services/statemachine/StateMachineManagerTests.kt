@@ -93,25 +93,25 @@ class StateMachineManagerTests {
     fun `exception while fiber suspended`() {
         node2.services.registerFlowInitiator(ReceiveFlow::class) { SendFlow(2, it) }
         val flow = ReceiveFlow(node2.info.legalIdentity)
-        val fiber = node1.services.startFlow(flow) as FlowStateMachineImpl
+        val stateMachine = node1.services.startFlow(flow) as FlowStateMachineImpl
         // Before the flow runs change the suspend action to throw an exception
         val exceptionDuringSuspend = Exception("Thrown during suspend")
-        fiber.actionOnSuspend = {
+        stateMachine.actionOnSuspend = {
             throw exceptionDuringSuspend
         }
         var uncaughtException: Throwable? = null
-        fiber.uncaughtExceptionHandler = UncaughtExceptionHandler { f, e ->
+        stateMachine.fiber.uncaughtExceptionHandler = UncaughtExceptionHandler { f, e ->
             uncaughtException = e
         }
         net.runNetwork()
         assertThatThrownBy {
-            fiber.resultFuture.getOrThrow()
+            stateMachine.resultFuture.getOrThrow()
         }.isSameAs(exceptionDuringSuspend)
         assertThat(node1.smm.allStateMachines).isEmpty()
         // Make sure it doesn't get swallowed up
         assertThat(uncaughtException?.rootCause).isSameAs(exceptionDuringSuspend)
         // Make sure the fiber does actually terminate
-        assertThat(fiber.isTerminated).isTrue()
+        assertThat(stateMachine.fiber.isTerminated).isTrue()
     }
 
     @Test
@@ -364,18 +364,20 @@ class StateMachineManagerTests {
     @Test
     fun `FlowException thrown on other side`() {
         val exception = MyFlowException("Nothing useful")
-        val erroringFiber = node2.initiateSingleShotFlow(ReceiveFlow::class) { ExceptionFlow(exception) }.map { it.stateMachine as FlowStateMachineImpl }
-        val receivingFiber = node1.services.startFlow(ReceiveFlow(node2.info.legalIdentity)) as FlowStateMachineImpl
+        val erroringStateMachine = node2
+                .initiateSingleShotFlow(ReceiveFlow::class) { ExceptionFlow(exception) }
+                .map { it.stateMachine as FlowStateMachineImpl }
+        val receivingStateMachine = node1.services.startFlow(ReceiveFlow(node2.info.legalIdentity)) as FlowStateMachineImpl
         net.runNetwork()
         assertThatExceptionOfType(MyFlowException::class.java)
-                .isThrownBy { receivingFiber.resultFuture.getOrThrow() }
+                .isThrownBy { receivingStateMachine.resultFuture.getOrThrow() }
                 .withMessage("Nothing useful")
                 .withStackTraceContaining("ReceiveFlow")  // Make sure the stack trace is that of the receiving flow
         databaseTransaction(node2.database) {
             assertThat(node2.checkpointStorage.checkpoints()).isEmpty()
         }
-        assertThat(receivingFiber.isTerminated).isTrue()
-        assertThat(erroringFiber.getOrThrow().isTerminated).isTrue()
+        assertThat(receivingStateMachine.fiber.isTerminated).isTrue()
+        assertThat(erroringStateMachine.getOrThrow().fiber.isTerminated).isTrue()
         assertSessionTransfers(
                 node1 sent sessionInit(ReceiveFlow::class) to node2,
                 node2 sent sessionConfirm to node1,
