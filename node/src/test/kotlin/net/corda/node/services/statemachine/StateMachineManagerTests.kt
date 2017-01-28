@@ -174,7 +174,9 @@ class StateMachineManagerTests {
         node2.smm.executor.flush()
         node2.disableDBCloseOnStop()
         node2.stop() // kill receiver
+        println("STOPPED")
         val restoredFlow = node2.restartAndGetRestoredFlow<ReceiveFlow>(node1)
+        println("RESTORED")
         assertThat(restoredFlow.receivedPayloads[0]).isEqualTo(payload)
     }
 

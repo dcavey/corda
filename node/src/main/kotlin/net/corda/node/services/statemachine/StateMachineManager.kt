@@ -152,7 +152,7 @@ class StateMachineManager(val serviceHub: ServiceHubInternal,
     }
 
     fun start() {
-        restoreStateMachinesFromCheckpoints()
+        restoreFibersFromCheckpoints()
         serviceHub.networkMapCache.mapServiceRegistered.then(executor) { resumeRestoredStateMachines() }
     }
 
@@ -191,14 +191,13 @@ class StateMachineManager(val serviceHub: ServiceHubInternal,
         }
     }
 
-    private fun restoreStateMachinesFromCheckpoints() {
+    private fun restoreFibersFromCheckpoints() {
         mutex.locked {
-            checkpointStorage.forEach {
+            checkpointStorage.forEach { checkpoint ->
                 // If a flow is added before start() then don't attempt to restore it
-                if (!stateMachines.containsValue(it)) {
-                    val stateMachine = deserializeStateMachine(it.serializedFiber)
-                    initStateMachine(stateMachine)
-                    stateMachines[stateMachine] = it
+                if (!stateMachines.containsValue(checkpoint)) {
+                    val stateMachine = deserialiseStateMachine(checkpoint)
+                    stateMachines[stateMachine] = checkpoint
                 }
                 true
             }
@@ -291,7 +290,7 @@ class StateMachineManager(val serviceHub: ServiceHubInternal,
 
         val session = try {
             val flow = flowFactory(sender)
-            val stateMachine = createStateMachine(flow)
+            val stateMachine = wrapFlowInStateMachine(flow)
             val session = FlowSession(flow, random63BitValue(), FlowSessionState.Initiated(sender, otherPartySessionId))
             if (sessionInit.firstPayload != null) {
                 session.receivedMessages += ReceivedSessionMessage(sender, SessionData(session.ourSessionId, sessionInit.firstPayload))
@@ -311,18 +310,19 @@ class StateMachineManager(val serviceHub: ServiceHubInternal,
         startStateMachine(session.stateMachine)
     }
 
-    private fun serializeStateMachine(stateMachine: FlowStateMachineImpl<*>): SerializedBytes<FlowStateMachineImpl<*>> {
+    private fun serialiseFiber(fiber: StateMachineFiber<*>): SerializedBytes<StateMachineFiber<*>> {
         val kryo = quasarKryo()
         // add the map of tokens -> tokenizedServices to the kyro context
         SerializeAsTokenSerializer.setContext(kryo, serializationContext)
-        return stateMachine.serialize(kryo)
+        return fiber.serialize(kryo)
     }
 
-    private fun deserializeStateMachine(serialisedStateMachine: SerializedBytes<FlowStateMachineImpl<*>>): FlowStateMachineImpl<*> {
+    private fun deserialiseStateMachine(checkpoint: Checkpoint): FlowStateMachineImpl<*> {
         val kryo = quasarKryo()
         // put the map of token -> tokenized into the kryo context
         SerializeAsTokenSerializer.setContext(kryo, serializationContext)
-        return serialisedStateMachine.deserialize(kryo).apply { fromCheckpoint = true }
+        val fiber = checkpoint.serializedFiber.deserialize(kryo)
+        return wrapFiberInStateMachine(fiber).apply { fiber.fromCheckpoint = true }
     }
 
     private fun quasarKryo(): Kryo {
@@ -330,13 +330,16 @@ class StateMachineManager(val serviceHub: ServiceHubInternal,
         return createKryo(serializer.kryo)
     }
 
-    private fun <T> createStateMachine(logic: FlowLogic<T>): FlowStateMachineImpl<T> {
+    private fun <R> wrapFlowInStateMachine(logic: FlowLogic<R>): FlowStateMachineImpl<R> {
         val id = StateMachineRunId.createRandom()
-        return FlowStateMachineImpl(id, logic, scheduler).apply { initStateMachine(this) }
+        val fiber = StateMachineFiber(id, logic, scheduler)
+        return wrapFiberInStateMachine(fiber)
     }
 
-    private fun <R> initStateMachine(stateMachine: FlowStateMachineImpl<R>) {
-        stateMachine.fiber.stateMachine = stateMachine
+    private fun <R> wrapFiberInStateMachine(fiber: StateMachineFiber<R>): FlowStateMachineImpl<R> {
+        val stateMachine = FlowStateMachineImpl<R>()
+        fiber.logic.stateMachine = stateMachine
+        stateMachine.fiber = fiber
         stateMachine.database = database
         stateMachine.serviceHub = serviceHub
         stateMachine.actionOnSuspend = { ioRequest ->
@@ -367,23 +370,28 @@ class StateMachineManager(val serviceHub: ServiceHubInternal,
             unfinishedStateMachines.countUp()
             notifyChangeObservers(stateMachine, AddOrRemove.ADD)
         }
+        return stateMachine
     }
 
     private fun endAllStateMachineSessions(stateMachine: FlowStateMachineImpl<*>, errorResponse: FlowException?) {
         openSessions.values.removeIf { session ->
             if (session.stateMachine == stateMachine) {
-                val initiatedState = session.state as? FlowSessionState.Initiated
-                if (initiatedState != null) {
-                    sendSessionMessage(
-                            initiatedState.peerParty,
-                            SessionEnd(initiatedState.peerSessionId, errorResponse),
-                            stateMachine)
-                    recentlyClosedSessions[session.ourSessionId] = initiatedState.peerParty
-                }
+                session.endSession(errorResponse)
                 true
             } else {
                 false
             }
+        }
+    }
+
+    private fun FlowSession.endSession(errorResponse: FlowException?) {
+        val initiatedState = state as? Initiated
+        if (initiatedState != null) {
+            sendSessionMessage(
+                    initiatedState.peerParty,
+                    SessionEnd(initiatedState.peerSessionId, errorResponse),
+                    stateMachine)
+            recentlyClosedSessions[ourSessionId] = initiatedState.peerParty
         }
     }
 
@@ -420,7 +428,7 @@ class StateMachineManager(val serviceHub: ServiceHubInternal,
         // unable to acquire the table lock and move forward till the calling transaction finishes.
         // Committing in line here on a fresh context ensure we can progress.
         val stateMachine = isolatedTransaction(database) {
-            val stateMachine = createStateMachine(logic)
+            val stateMachine = wrapFlowInStateMachine(logic)
             updateCheckpoint(stateMachine)
             stateMachine
         }
@@ -435,7 +443,7 @@ class StateMachineManager(val serviceHub: ServiceHubInternal,
 
     private fun updateCheckpoint(stateMachine: FlowStateMachineImpl<*>) {
         check(stateMachine.fiber.state != Strand.State.RUNNING) { "Fiber cannot be running when checkpointing" }
-        val newCheckpoint = Checkpoint(serializeStateMachine(stateMachine))
+        val newCheckpoint = Checkpoint(serialiseFiber(stateMachine.fiber))
         val previousCheckpoint = mutex.locked { stateMachines.put(stateMachine, newCheckpoint) }
         if (previousCheckpoint != null) {
             checkpointStorage.removeCheckpoint(previousCheckpoint)
@@ -448,7 +456,7 @@ class StateMachineManager(val serviceHub: ServiceHubInternal,
         // Avoid race condition when setting stopping to true and then checking liveFibers
         incrementLiveStateMachines()
         if (!stopping) executor.executeASAP {
-            stateMachine.resume(scheduler)
+            stateMachine.fiber.resume(scheduler)
         } else {
             stateMachine.logger.debug("Not resuming as SMM is stopping.")
             decrementLiveStateMachines()

@@ -183,7 +183,7 @@ abstract class FlowLogic<out T> {
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    private var _stateMachine: FlowStateMachine<*>? = null
+    @Transient private var _stateMachine: FlowStateMachine<*>? = null
     /**
      * Internal only. Reference to the [Fiber] instance that is the top level controller for the entire flow. When
      * inside a flow this is equivalent to [Strand.currentStrand]. This is public only because it must be accessed
